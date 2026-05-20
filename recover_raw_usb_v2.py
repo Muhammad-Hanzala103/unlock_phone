@@ -9,6 +9,7 @@ import os
 import sys
 import time
 import ctypes
+import subprocess
 
 def is_admin():
     try:
@@ -47,6 +48,20 @@ SIGNATURES = {
         'max_size': 15 * 1024 * 1024 * 1024  # Max 15 GB
     }
 }
+
+def get_windows_disk_size(drive_id):
+    """
+    Queries the exact disk size in bytes using PowerShell to avoid direct raw seek limitations.
+    """
+    try:
+        cmd = f"powershell -Command \"(Get-Disk -Number {drive_id}).Size\""
+        output = subprocess.check_output(cmd, shell=True, stderr=subprocess.DEVNULL).decode().strip()
+        if output.isdigit():
+            return int(output)
+    except:
+        pass
+    # Fallback default if query fails
+    return 62 * 1024 * 1024 * 1024 
 
 def read_unaligned(disk, pos, size):
     """
@@ -165,12 +180,11 @@ def main():
     print("======================================================================")
     print("Starting sector scanning. Please wait...")
     
+    # Get exact physical disk size using PowerShell query (safest method)
+    disk_size = get_windows_disk_size(args.drive)
+    
     try:
         disk = open(drive_path, "rb")
-        # Get physical disk total size
-        disk.seek(0, 2)
-        disk_size = disk.tell()
-        disk.seek(0)
     except Exception as e:
         print(f"❌ FAILED TO OPEN DRIVE: {e}")
         print("Please check if the drive number is correct and powershell is Run as Administrator.")
