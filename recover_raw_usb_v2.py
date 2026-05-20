@@ -1,5 +1,5 @@
 # ==============================================================================
-# PRECISION RAW USB DATA RECOVERY TOOL (V2 - MOVIE FIXED + CRASH PROOF + FULL DISK)
+# PRECISION RAW USB DATA RECOVERY TOOL (V2 - MOVIE FIXED + CRASH PROOF + CONTINUOUS SCAN)
 # Designed for: Muhammad Hanzala
 # Recovers: Full-size Wedding Videos (MP4, MOV) and Photos (JPEG, PNG)
 # Safe, Fast, and Direct
@@ -45,7 +45,7 @@ SIGNATURES = {
     },
     'mp4_mov': {
         'start': b'ftyp',
-        'max_size': 15 * 1024 * 1024 * 1024  # Max 15 GB
+        'max_size': 4200 * 1024 * 1024  # Max 4.2 GB (Standard camera FAT32/exFAT split limit)
     }
 }
 
@@ -60,14 +60,13 @@ def get_windows_disk_size(drive_id):
             return int(output)
     except:
         pass
-    # Fallback default if query fails (approx 62 GB)
+    # Fallback default if query fails
     return 62 * 1024 * 1024 * 1024 
 
 def read_unaligned(disk, pos, size, disk_size):
     """
     Reads 'size' bytes from raw physical disk at arbitrary byte position 'pos' 
-    by aligning seeks and reads to 512-byte sector boundaries. 
-    Prevents Windows OSError [Errno 22] Invalid argument and avoids out-of-bounds taints.
+    by aligning seeks and reads to 512-byte sector boundaries.
     """
     if pos >= disk_size:
         return b""
@@ -77,7 +76,6 @@ def read_unaligned(disk, pos, size, disk_size):
     aligned_pos = (pos // 512) * 512
     skip_bytes = pos % 512
     
-    # Read block must be a multiple of 512 bytes
     total_to_read = ((skip_bytes + size + 511) // 512) * 512
     if aligned_pos + total_to_read > disk_size:
         total_to_read = disk_size - aligned_pos
@@ -185,7 +183,7 @@ def main():
         os.makedirs(out_dir)
         
     print("======================================================================")
-    print("         PRECISION RAW USB CARVING TOOL - MOVIE FIXED                 ")
+    print("         PRECISION RAW USB CARVING TOOL - CONTINUOUS SCAN             ")
     print("======================================================================")
     print(f" Source Drive:  {drive_path}")
     print(f" Target Output: {out_dir}")
@@ -238,7 +236,7 @@ def main():
                     
                 print(f"\n⚠️ Warning: Skipped unreadable sector block at {disk_offset // (1024*1024)} MB (Error: {e})")
                 
-                # Auto-heal and reopen disk handle to clear the taint/lock state
+                # Auto-heal and reopen disk handle
                 try:
                     disk.close()
                     disk = open(drive_path, "rb")
@@ -270,22 +268,16 @@ def main():
                     # Parse length of entire video file
                     file_size = parse_mp4_length(disk, start_disk_pos, disk_size)
                     
-                    # SAFETY CHECK: File size must fit inside physical drive and be reasonable
+                    # SAFETY CHECK: File size must fit inside physical drive and be reasonable (max 4.2 GB)
                     if 1000 < file_size < SIGNATURES['mp4_mov']['max_size'] and (start_disk_pos + file_size) <= disk_size:
                         counts['video'] += 1
                         if not dry_run:
                             filename = os.path.join(out_dir, f"wedding_video_{counts['video']:03d}.mp4")
                             recover_file(disk, start_disk_pos, file_size, filename, disk_size)
                             
-                        # Skip physical disk and buffer scanning beyond this file
-                        end_disk_pos = start_disk_pos + file_size
-                        disk.seek(end_disk_pos)
-                        
-                        # Add the skipped file size to our simulated total scanned count
-                        total_scanned += (end_disk_pos - disk_offset)
-                        disk_offset = end_disk_pos
-                        buffer = b""
-                        break  # Break inner loop to read new data from skipped position
+                        # Do NOT skip disk scanning offset. Continue scanning from next sector
+                        # to find all other files.
+                        i += 4
                     else:
                         i += 1
                         
@@ -340,7 +332,6 @@ def main():
             elapsed = time.time() - start_time
             speed = (total_scanned / (1024 * 1024)) / elapsed if elapsed > 0 else 0
             
-            # Print exact scanning progress percentage
             percent = (disk_offset / disk_size) * 100 if disk_size > 0 else 0
             sys.stdout.write(
                 f"\rScanned: {disk_offset // (1024*1024)} MB / {disk_size // (1024*1024)} MB ({percent:.1f}%) | Photos: {counts['jpg'] + counts['png']} | Videos: {counts['video']}"
