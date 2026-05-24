@@ -71,6 +71,18 @@ class RepairPlan:
         return len(SYNTHETIC_FTYP) + self.moov.size + self.mdat.size
 
 
+@dataclass(frozen=True)
+class SegmentPlan:
+    index: int
+    ftyp: Box
+    moov: Box
+    mdat: Box
+
+    @property
+    def output_size(self) -> int:
+        return self.ftyp.size + self.moov.size + self.mdat.size
+
+
 def fmt_size(size: int) -> str:
     units = ("B", "KB", "MB", "GB")
     value = float(size)
@@ -192,6 +204,37 @@ def choose_repair_plan(path: Path) -> tuple[RepairPlan | None, str]:
             return best, "ok"
 
 
+def find_segment_plans(path: Path) -> list[SegmentPlan]:
+    plans: list[SegmentPlan] = []
+    with path.open("rb") as fh:
+        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as view:
+            boxes = collect_boxes(view)
+            ftyp_boxes = sorted(
+                (box for box in boxes[b"ftyp"] if is_valid_ftyp(view, box)),
+                key=lambda item: item.offset,
+            )
+            moov_boxes = sorted(boxes[b"moov"], key=lambda item: item.offset)
+            mdat_boxes = sorted(boxes[b"mdat"], key=lambda item: item.offset)
+
+            for ftyp in ftyp_boxes:
+                mdat = next((box for box in mdat_boxes if box.offset == ftyp.end), None)
+                if not mdat:
+                    continue
+                preceding_moovs = [
+                    box
+                    for box in moov_boxes
+                    if box.end <= ftyp.offset and ftyp.offset - box.end <= 2 * 1024 * 1024
+                ]
+                if not preceding_moovs:
+                    continue
+                moov = max(preceding_moovs, key=lambda item: item.offset)
+                if moov.size < 256 or mdat.size < 1024 * 1024:
+                    continue
+                plans.append(SegmentPlan(len(plans) + 1, ftyp=ftyp, moov=moov, mdat=mdat))
+
+    return plans
+
+
 def patch_chunk_offsets(moov_data: bytearray, delta: int, strict: bool = True) -> tuple[int, int]:
     patched_stco = 0
     patched_co64 = 0
@@ -302,6 +345,26 @@ def write_repaired_file(src: Path, dst: Path, plan: RepairPlan) -> tuple[int, in
             return patched_stco, patched_co64, "preserved-order"
 
 
+def write_segment_file(src: Path, dst: Path, plan: SegmentPlan) -> tuple[int, int]:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with src.open("rb") as in_fh, dst.open("wb") as out_fh:
+        in_fh.seek(plan.ftyp.offset)
+        ftyp_data = in_fh.read(plan.ftyp.size)
+        in_fh.seek(plan.moov.offset)
+        moov_data = bytearray(in_fh.read(plan.moov.size))
+
+        # These camera fragments store chunk offsets relative to their ftyp start.
+        # Inserting moov after ftyp shifts media data by exactly moov.size bytes.
+        delta = len(moov_data)
+        patched_stco, patched_co64 = patch_chunk_offsets(moov_data, delta)
+
+        out_fh.write(ftyp_data)
+        out_fh.write(moov_data)
+        copy_range(in_fh, out_fh, plan.mdat.offset, plan.mdat.size)
+
+    return patched_stco, patched_co64
+
+
 def repair_file(src: Path, out_dir: Path) -> str:
     original_size = src.stat().st_size
     plan, reason = choose_repair_plan(src)
@@ -326,6 +389,34 @@ def repair_file(src: Path, out_dir: Path) -> str:
     )
 
 
+def extract_segments(src: Path, out_dir: Path) -> str:
+    plans = find_segment_plans(src)
+    if not plans:
+        return f"SEGSKIP {src.name}: no internal moov/ftyp/mdat segments found"
+
+    segment_dir = out_dir / f"{src.stem}_segments"
+    written = 0
+    failed = 0
+    total_bytes = 0
+    for plan in plans:
+        out_file = segment_dir / f"{src.stem}_segment_{plan.index:03d}.mp4"
+        try:
+            write_segment_file(src, out_file, plan)
+            written += 1
+            total_bytes += out_file.stat().st_size
+        except Exception as exc:
+            failed += 1
+            print(
+                f"SEGFAIL {src.name} #{plan.index:03d}: "
+                f"moov={plan.moov.offset:,} ftyp={plan.ftyp.offset:,} "
+                f"mdat={plan.mdat.offset:,} error={exc}"
+            )
+
+    return (
+        f"SEGDONE {src.name}: segments={written} failed={failed} "
+        f"total={fmt_size(total_bytes)} -> {segment_dir}"
+    )
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Repair MP4 files recovered with broken leading ftyp data."
@@ -345,6 +436,11 @@ def parse_args():
         nargs="*",
         default=list(TARGET_FILES),
         help="Specific filenames to repair.",
+    )
+    parser.add_argument(
+        "--extract-segments",
+        action="store_true",
+        help="Also extract every internal moov/ftyp/mdat clip found inside huge carved files.",
     )
     return parser.parse_args()
 
@@ -368,6 +464,8 @@ def main():
             continue
         try:
             print(repair_file(src, output_dir))
+            if args.extract_segments:
+                print(extract_segments(src, output_dir))
         except Exception as exc:
             print(f"FAIL  {name}: {exc}")
 
