@@ -220,14 +220,14 @@ def find_segment_plans(path: Path) -> list[SegmentPlan]:
                 mdat = next((box for box in mdat_boxes if box.offset == ftyp.end), None)
                 if not mdat:
                     continue
-                preceding_moovs = [
+                following_moovs = [
                     box
                     for box in moov_boxes
-                    if box.end <= ftyp.offset and ftyp.offset - box.end <= 2 * 1024 * 1024
+                    if box.offset >= mdat.end and box.offset - mdat.end <= 2 * 1024 * 1024
                 ]
-                if not preceding_moovs:
+                if not following_moovs:
                     continue
-                moov = max(preceding_moovs, key=lambda item: item.offset)
+                moov = min(following_moovs, key=lambda item: item.offset)
                 if moov.size < 256 or mdat.size < 1024 * 1024:
                     continue
                 plans.append(SegmentPlan(len(plans) + 1, ftyp=ftyp, moov=moov, mdat=mdat))
@@ -348,21 +348,11 @@ def write_repaired_file(src: Path, dst: Path, plan: RepairPlan) -> tuple[int, in
 def write_segment_file(src: Path, dst: Path, plan: SegmentPlan) -> tuple[int, int]:
     dst.parent.mkdir(parents=True, exist_ok=True)
     with src.open("rb") as in_fh, dst.open("wb") as out_fh:
-        in_fh.seek(plan.ftyp.offset)
-        ftyp_data = in_fh.read(plan.ftyp.size)
-        in_fh.seek(plan.moov.offset)
-        moov_data = bytearray(in_fh.read(plan.moov.size))
-
-        # These camera fragments store chunk offsets relative to their ftyp start.
-        # Inserting moov after ftyp shifts media data by exactly moov.size bytes.
-        delta = len(moov_data)
-        patched_stco, patched_co64 = patch_chunk_offsets(moov_data, delta)
-
-        out_fh.write(ftyp_data)
-        out_fh.write(moov_data)
+        copy_range(in_fh, out_fh, plan.ftyp.offset, plan.ftyp.size)
         copy_range(in_fh, out_fh, plan.mdat.offset, plan.mdat.size)
+        copy_range(in_fh, out_fh, plan.moov.offset, plan.moov.size)
 
-    return patched_stco, patched_co64
+    return 0, 0
 
 
 def repair_file(src: Path, out_dir: Path) -> str:
