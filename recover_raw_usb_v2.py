@@ -101,8 +101,13 @@ def parse_mp4_length(disk, start_disk_offset, disk_size):
     Parses the top-level atom/box structures sequentially to find the exact end 
     and size of an MP4/MOV file. Aligned to 512-byte sector boundaries.
     """
+    if start_disk_offset < 0:
+        return 0
+
     current_pos = start_disk_offset
     total_file_size = 0
+    saw_mdat = False
+    saw_moov = False
     
     known_boxes = {
         b'ftyp', b'mdat', b'moov', b'free', b'skip', 
@@ -129,19 +134,34 @@ def parse_mp4_length(disk, start_disk_offset, disk_size):
             # Validation: Size must be realistic and box type must be standard ASCII
             if box_size < 8:
                 break
+
+            if current_pos == start_disk_offset:
+                if box_type != b'ftyp':
+                    return 0
+                if box_size < 16 or box_size > 1024:
+                    return 0
+                brand_data = read_unaligned(disk, current_pos + 8, min(box_size - 8, 64), disk_size)
+                known_brands = (b'isom', b'iso2', b'mp41', b'mp42', b'avc1', b'qt  ', b'3gp4', b'M4V ', b'M4A ')
+                if not any(brand in brand_data for brand in known_brands):
+                    return 0
                 
             # If the box name is valid ASCII or in known box types, keep traversing
             is_valid_type = box_type in known_boxes or all(32 <= b <= 126 for b in box_type)
             if not is_valid_type:
                 break
+
+            if (current_pos + box_size) > disk_size:
+                break
                 
             total_file_size += box_size
             current_pos += box_size
+            saw_mdat = saw_mdat or box_type == b'mdat'
+            saw_moov = saw_moov or box_type == b'moov'
         except Exception:
             break
             
     # Safe validation limit
-    if total_file_size < 100:
+    if total_file_size < 100 or not saw_mdat or not saw_moov:
         return 0
     return total_file_size
 
@@ -263,6 +283,10 @@ def main():
             while i < buffer_len - overlap:
                 # 1. MP4/MOV Scanner (Dynamic Box parsing)
                 if buffer[i:i+4] == SIGNATURES['mp4_mov']['start']:
+                    if i < 4:
+                        i += 1
+                        continue
+
                     start_disk_pos = (disk_offset - buffer_len) + i - 4
                     
                     # Parse length of entire video file

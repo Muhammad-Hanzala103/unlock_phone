@@ -1,4 +1,5 @@
 import argparse
+import mmap
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,30 +24,51 @@ TOP_LEVEL_BOXES = {
     b"uuid",
 }
 
-SCAN_CHUNK_SIZE = 8 * 1024 * 1024
+BRANDS = {
+    b"isom",
+    b"iso2",
+    b"mp41",
+    b"mp42",
+    b"avc1",
+    b"qt  ",
+    b"3gp4",
+    b"M4V ",
+    b"M4A ",
+}
+
+SYNTHETIC_FTYP = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+SCAN_TYPES = (b"ftyp", b"moov", b"mdat")
 COPY_CHUNK_SIZE = 8 * 1024 * 1024
-MAX_BOX_COUNT = 128
-MAX_CANDIDATE_SPAN = 4300 * 1024 * 1024
+MAX_BOX_SIZE = 4300 * 1024 * 1024
 
 
-@dataclass
+@dataclass(frozen=True)
 class Box:
     offset: int
     size: int
     box_type: bytes
-
-
-@dataclass
-class Candidate:
-    start: int
-    end: int
-    boxes: list[Box]
-    has_mdat: bool
-    has_moov: bool
+    header_size: int = 8
 
     @property
-    def size(self) -> int:
-        return self.end - self.start
+    def end(self) -> int:
+        return self.offset + self.size
+
+    @property
+    def data_offset(self) -> int:
+        return self.offset + self.header_size
+
+
+@dataclass(frozen=True)
+class RepairPlan:
+    ftyp: Box | None
+    ftyp_signature_offset: int | None
+    moov: Box
+    mdat: Box
+    synthetic_ftyp: bool
+
+    @property
+    def output_size(self) -> int:
+        return len(SYNTHETIC_FTYP) + self.moov.size + self.mdat.size
 
 
 def fmt_size(size: int) -> str:
@@ -59,156 +81,234 @@ def fmt_size(size: int) -> str:
     return f"{size} B"
 
 
-def iter_ftyp_offsets(path: Path):
-    tail = b""
-    offset = 0
-    with path.open("rb") as fh:
-        while True:
-            data = fh.read(SCAN_CHUNK_SIZE)
-            if not data:
-                break
-            buf = tail + data
-            base_offset = offset - len(tail)
-            idx = buf.find(b"ftyp")
-            while idx != -1:
-                if base_offset + idx >= 4:
-                    yield base_offset + idx - 4
-                idx = buf.find(b"ftyp", idx + 1)
-            tail = buf[-7:]
-            offset += len(data)
-
-
-def read_box_header(fh, offset: int, file_size: int):
+def read_box_header_from_view(view, offset: int) -> Box | None:
+    file_size = len(view)
     if offset < 0 or offset + 8 > file_size:
         return None
 
-    fh.seek(offset)
-    header = fh.read(16)
-    if len(header) < 8:
-        return None
-
-    box_size = int.from_bytes(header[0:4], "big")
-    box_type = header[4:8]
+    box_size = int.from_bytes(view[offset : offset + 4], "big")
+    box_type = bytes(view[offset + 4 : offset + 8])
     header_size = 8
 
     if box_size == 1:
-        if len(header) < 16:
+        if offset + 16 > file_size:
             return None
-        box_size = int.from_bytes(header[8:16], "big")
+        box_size = int.from_bytes(view[offset + 8 : offset + 16], "big")
         header_size = 16
     elif box_size == 0:
         box_size = file_size - offset
 
+    if box_type not in TOP_LEVEL_BOXES:
+        return None
     if box_size < header_size:
+        return None
+    if box_size > MAX_BOX_SIZE:
         return None
     if offset + box_size > file_size:
         return None
-    if box_type not in TOP_LEVEL_BOXES:
-        return None
 
-    return Box(offset=offset, size=box_size, box_type=box_type)
+    return Box(offset=offset, size=box_size, box_type=box_type, header_size=header_size)
 
 
-def parse_candidate(path: Path, start: int) -> Candidate | None:
-    file_size = path.stat().st_size
-    boxes: list[Box] = []
-    cursor = start
-    has_mdat = False
-    has_moov = False
+def is_valid_ftyp(view, box: Box) -> bool:
+    if box.box_type != b"ftyp" or box.size < 16:
+        return False
+    major_brand = bytes(view[box.offset + 8 : box.offset + 12])
+    compatible = bytes(view[box.offset + 16 : box.end])
+    if major_brand in BRANDS:
+        return True
+    return any(brand in compatible for brand in BRANDS)
 
-    with path.open("rb") as fh:
-        first_box = read_box_header(fh, cursor, file_size)
-        if not first_box or first_box.box_type != b"ftyp":
-            return None
 
-        cursor += first_box.size
-        boxes.append(first_box)
+def iter_signature_offsets(view, signature: bytes):
+    offset = view.find(signature)
+    while offset != -1:
+        yield offset
+        offset = view.find(signature, offset + 1)
 
-        for _ in range(MAX_BOX_COUNT - 1):
-            if cursor >= file_size:
-                break
-            if cursor - start > MAX_CANDIDATE_SPAN:
-                return None
 
-            box = read_box_header(fh, cursor, file_size)
-            if not box:
-                break
+def collect_boxes(view) -> dict[bytes, list[Box]]:
+    found = {box_type: [] for box_type in SCAN_TYPES}
+    seen: set[tuple[int, bytes]] = set()
 
-            boxes.append(box)
-            has_mdat = has_mdat or box.box_type == b"mdat"
-            has_moov = has_moov or box.box_type == b"moov"
-            cursor += box.size
-
-            if has_mdat and has_moov:
-                # Keep parsing contiguous harmless trailing boxes, but this is now viable.
+    for box_type in SCAN_TYPES:
+        for signature_offset in iter_signature_offsets(view, box_type):
+            header_offset = signature_offset - 4
+            box = read_box_header_from_view(view, header_offset)
+            if not box or box.box_type != box_type:
                 continue
+            key = (box.offset, box.box_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            found[box_type].append(box)
 
-    if len(boxes) < 3 or not has_mdat or not has_moov:
-        return None
-    if boxes[0].box_type != b"ftyp":
-        return None
-
-    return Candidate(
-        start=start,
-        end=boxes[-1].offset + boxes[-1].size,
-        boxes=boxes,
-        has_mdat=has_mdat,
-        has_moov=has_moov,
-    )
+    return found
 
 
-def find_best_candidate(path: Path) -> Candidate | None:
-    candidates: list[Candidate] = []
-    for start in iter_ftyp_offsets(path):
-        candidate = parse_candidate(path, start)
-        if candidate:
-            candidates.append(candidate)
-
-    if not candidates:
-        return None
-
-    # Prefer the largest valid contiguous MP4 segment; tiny segments can be thumbnails/previews.
-    return max(candidates, key=lambda item: item.size)
+def first_ftyp_signature(view) -> int | None:
+    offset = view.find(b"ftyp")
+    return None if offset == -1 else offset
 
 
-def copy_range(src: Path, dst: Path, start: int, end: int):
-    remaining = end - start
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    with src.open("rb") as in_fh, dst.open("wb") as out_fh:
-        in_fh.seek(start)
-        while remaining > 0:
-            chunk = in_fh.read(min(COPY_CHUNK_SIZE, remaining))
-            if not chunk:
-                break
-            out_fh.write(chunk)
-            remaining -= len(chunk)
+def choose_repair_plan(path: Path) -> tuple[RepairPlan | None, str]:
+    with path.open("rb") as fh:
+        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as view:
+            boxes = collect_boxes(view)
+            ftyp_boxes = [box for box in boxes[b"ftyp"] if is_valid_ftyp(view, box)]
+            moov_boxes = sorted(boxes[b"moov"], key=lambda item: item.size, reverse=True)
+            mdat_boxes = sorted(boxes[b"mdat"], key=lambda item: item.size, reverse=True)
+
+            if not moov_boxes:
+                return None, "no valid moov box found"
+            if not mdat_boxes:
+                return None, "no valid mdat box found"
+
+            ftyp_box = min(ftyp_boxes, key=lambda item: item.offset) if ftyp_boxes else None
+            ftyp_sig = first_ftyp_signature(view)
+            best: RepairPlan | None = None
+            best_score = -1
+
+            for moov in moov_boxes[:12]:
+                for mdat in mdat_boxes[:12]:
+                    if moov.offset == mdat.offset:
+                        continue
+                    if moov.size < 256 or mdat.size < 1024 * 1024:
+                        continue
+                    score = mdat.size + moov.size
+                    if score > best_score:
+                        best = RepairPlan(
+                            ftyp=ftyp_box,
+                            ftyp_signature_offset=ftyp_sig,
+                            moov=moov,
+                            mdat=mdat,
+                            synthetic_ftyp=ftyp_box is None,
+                        )
+                        best_score = score
+
+            if not best:
+                return None, "no coherent moov/mdat pair found"
+
+            return best, "ok"
+
+
+def patch_chunk_offsets(moov_data: bytearray, delta: int) -> tuple[int, int]:
+    patched_stco = 0
+    patched_co64 = 0
+    cursor = 0
+
+    while True:
+        idx = moov_data.find(b"stco", cursor)
+        if idx == -1:
+            break
+        box_start = idx - 4
+        if box_start >= 0:
+            box_size = int.from_bytes(moov_data[box_start:idx], "big")
+            entry_count_offset = idx + 8
+            entries_offset = idx + 12
+            if box_size >= 16 and box_start + box_size <= len(moov_data):
+                entry_count = int.from_bytes(moov_data[entry_count_offset:entries_offset], "big")
+                entries_end = entries_offset + (entry_count * 4)
+                if entries_end <= box_start + box_size:
+                    for pos in range(entries_offset, entries_end, 4):
+                        old = int.from_bytes(moov_data[pos : pos + 4], "big")
+                        new = old + delta
+                        if not 0 <= new <= 0xFFFFFFFF:
+                            raise ValueError("stco offset adjustment overflow")
+                        moov_data[pos : pos + 4] = new.to_bytes(4, "big")
+                    patched_stco += 1
+        cursor = idx + 4
+
+    cursor = 0
+    while True:
+        idx = moov_data.find(b"co64", cursor)
+        if idx == -1:
+            break
+        box_start = idx - 4
+        if box_start >= 0:
+            box_size = int.from_bytes(moov_data[box_start:idx], "big")
+            entry_count_offset = idx + 8
+            entries_offset = idx + 12
+            if box_size >= 20 and box_start + box_size <= len(moov_data):
+                entry_count = int.from_bytes(moov_data[entry_count_offset:entries_offset], "big")
+                entries_end = entries_offset + (entry_count * 8)
+                if entries_end <= box_start + box_size:
+                    for pos in range(entries_offset, entries_end, 8):
+                        old = int.from_bytes(moov_data[pos : pos + 8], "big")
+                        new = old + delta
+                        if not 0 <= new <= 0xFFFFFFFFFFFFFFFF:
+                            raise ValueError("co64 offset adjustment overflow")
+                        moov_data[pos : pos + 8] = new.to_bytes(8, "big")
+                    patched_co64 += 1
+        cursor = idx + 4
+
+    return patched_stco, patched_co64
+
+
+def copy_range(src_fh, dst_fh, start: int, size: int):
+    src_fh.seek(start)
+    remaining = size
+    while remaining > 0:
+        chunk = src_fh.read(min(COPY_CHUNK_SIZE, remaining))
+        if not chunk:
+            break
+        dst_fh.write(chunk)
+        remaining -= len(chunk)
 
     if remaining:
         raise OSError(f"copy ended early with {remaining} bytes remaining")
 
 
+def write_repaired_file(src: Path, dst: Path, plan: RepairPlan) -> tuple[int, int]:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with src.open("rb") as in_fh, dst.open("wb") as out_fh:
+        ftyp_data = SYNTHETIC_FTYP
+        if plan.ftyp and not plan.synthetic_ftyp:
+            in_fh.seek(plan.ftyp.offset)
+            ftyp_data = in_fh.read(plan.ftyp.size)
+
+        in_fh.seek(plan.moov.offset)
+        moov_data = bytearray(in_fh.read(plan.moov.size))
+
+        new_mdat_data_offset = len(ftyp_data) + len(moov_data) + plan.mdat.header_size
+        old_mdat_data_offset = plan.mdat.data_offset
+        delta = new_mdat_data_offset - old_mdat_data_offset
+        patched_stco, patched_co64 = patch_chunk_offsets(moov_data, delta)
+
+        out_fh.write(ftyp_data)
+        out_fh.write(moov_data)
+        copy_range(in_fh, out_fh, plan.mdat.offset, plan.mdat.size)
+
+    return patched_stco, patched_co64
+
+
 def repair_file(src: Path, out_dir: Path) -> str:
     original_size = src.stat().st_size
-    candidate = find_best_candidate(src)
-    if not candidate:
-        return (
-            f"SKIP  {src.name}: no valid MP4 segment found "
-            f"(original {fmt_size(original_size)})"
-        )
+    plan, reason = choose_repair_plan(src)
+    if not plan:
+        return f"SKIP  {src.name}: {reason} (source={fmt_size(original_size)})"
 
     out_file = out_dir / f"REPAIRED_{src.name}"
-    copy_range(src, out_file, candidate.start, candidate.end)
+    patched_stco, patched_co64 = write_repaired_file(src, out_file, plan)
+    repaired_size = out_file.stat().st_size
+    ftyp_note = (
+        f"ftyp={plan.ftyp.offset:,}"
+        if plan.ftyp and not plan.synthetic_ftyp
+        else f"ftyp=synthetic(sig={plan.ftyp_signature_offset})"
+    )
 
-    box_names = ",".join(box.box_type.decode("ascii") for box in candidate.boxes)
     return (
-        f"DONE  {src.name}: start={candidate.start:,} "
-        f"size={fmt_size(candidate.size)} boxes={box_names} -> {out_file}"
+        f"DONE  {src.name}: source={fmt_size(original_size)} "
+        f"{ftyp_note} moov={plan.moov.offset:,}/{fmt_size(plan.moov.size)} "
+        f"mdat={plan.mdat.offset:,}/{fmt_size(plan.mdat.size)} "
+        f"patched=stco:{patched_stco},co64:{patched_co64} "
+        f"output={fmt_size(repaired_size)} -> {out_file}"
     )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Repair MP4 files recovered with a broken leading ftyp size."
+        description="Repair MP4 files recovered with broken leading ftyp data."
     )
     parser.add_argument(
         "--input",
