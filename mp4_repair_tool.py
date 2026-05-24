@@ -111,7 +111,7 @@ def read_box_header_from_view(view, offset: int) -> Box | None:
 
 
 def is_valid_ftyp(view, box: Box) -> bool:
-    if box.box_type != b"ftyp" or box.size < 16:
+    if box.box_type != b"ftyp" or box.size < 16 or box.size > 1024:
         return False
     major_brand = bytes(view[box.offset + 8 : box.offset + 12])
     compatible = bytes(view[box.offset + 16 : box.end])
@@ -192,7 +192,7 @@ def choose_repair_plan(path: Path) -> tuple[RepairPlan | None, str]:
             return best, "ok"
 
 
-def patch_chunk_offsets(moov_data: bytearray, delta: int) -> tuple[int, int]:
+def patch_chunk_offsets(moov_data: bytearray, delta: int, strict: bool = True) -> tuple[int, int]:
     patched_stco = 0
     patched_co64 = 0
     cursor = 0
@@ -214,7 +214,9 @@ def patch_chunk_offsets(moov_data: bytearray, delta: int) -> tuple[int, int]:
                         old = int.from_bytes(moov_data[pos : pos + 4], "big")
                         new = old + delta
                         if not 0 <= new <= 0xFFFFFFFF:
-                            raise ValueError("stco offset adjustment overflow")
+                            if strict:
+                                raise ValueError("stco offset adjustment overflow")
+                            continue
                         moov_data[pos : pos + 4] = new.to_bytes(4, "big")
                     patched_stco += 1
         cursor = idx + 4
@@ -237,7 +239,9 @@ def patch_chunk_offsets(moov_data: bytearray, delta: int) -> tuple[int, int]:
                         old = int.from_bytes(moov_data[pos : pos + 8], "big")
                         new = old + delta
                         if not 0 <= new <= 0xFFFFFFFFFFFFFFFF:
-                            raise ValueError("co64 offset adjustment overflow")
+                            if strict:
+                                raise ValueError("co64 offset adjustment overflow")
+                            continue
                         moov_data[pos : pos + 8] = new.to_bytes(8, "big")
                     patched_co64 += 1
         cursor = idx + 4
@@ -259,7 +263,7 @@ def copy_range(src_fh, dst_fh, start: int, size: int):
         raise OSError(f"copy ended early with {remaining} bytes remaining")
 
 
-def write_repaired_file(src: Path, dst: Path, plan: RepairPlan) -> tuple[int, int]:
+def write_repaired_file(src: Path, dst: Path, plan: RepairPlan) -> tuple[int, int, str]:
     dst.parent.mkdir(parents=True, exist_ok=True)
     with src.open("rb") as in_fh, dst.open("wb") as out_fh:
         ftyp_data = SYNTHETIC_FTYP
@@ -273,13 +277,29 @@ def write_repaired_file(src: Path, dst: Path, plan: RepairPlan) -> tuple[int, in
         new_mdat_data_offset = len(ftyp_data) + len(moov_data) + plan.mdat.header_size
         old_mdat_data_offset = plan.mdat.data_offset
         delta = new_mdat_data_offset - old_mdat_data_offset
-        patched_stco, patched_co64 = patch_chunk_offsets(moov_data, delta)
+        try:
+            patched_stco, patched_co64 = patch_chunk_offsets(moov_data, delta)
+            out_fh.write(ftyp_data)
+            out_fh.write(moov_data)
+            copy_range(in_fh, out_fh, plan.mdat.offset, plan.mdat.size)
+            return patched_stco, patched_co64, "reordered"
+        except ValueError:
+            range_start = min(plan.moov.offset, plan.mdat.offset)
+            range_end = max(plan.moov.end, plan.mdat.end)
+            in_fh.seek(plan.moov.offset)
+            moov_data = bytearray(in_fh.read(plan.moov.size))
+            delta = len(ftyp_data) - range_start
+            patched_stco, patched_co64 = patch_chunk_offsets(moov_data, delta, strict=False)
 
-        out_fh.write(ftyp_data)
-        out_fh.write(moov_data)
-        copy_range(in_fh, out_fh, plan.mdat.offset, plan.mdat.size)
-
-    return patched_stco, patched_co64
+            out_fh.write(ftyp_data)
+            if plan.moov.offset < plan.mdat.offset:
+                out_fh.write(moov_data)
+                copy_range(in_fh, out_fh, plan.moov.end, range_end - plan.moov.end)
+            else:
+                copy_range(in_fh, out_fh, range_start, plan.moov.offset - range_start)
+                out_fh.write(moov_data)
+                copy_range(in_fh, out_fh, plan.moov.end, range_end - plan.moov.end)
+            return patched_stco, patched_co64, "preserved-order"
 
 
 def repair_file(src: Path, out_dir: Path) -> str:
@@ -289,7 +309,7 @@ def repair_file(src: Path, out_dir: Path) -> str:
         return f"SKIP  {src.name}: {reason} (source={fmt_size(original_size)})"
 
     out_file = out_dir / f"REPAIRED_{src.name}"
-    patched_stco, patched_co64 = write_repaired_file(src, out_file, plan)
+    patched_stco, patched_co64, mode = write_repaired_file(src, out_file, plan)
     repaired_size = out_file.stat().st_size
     ftyp_note = (
         f"ftyp={plan.ftyp.offset:,}"
@@ -301,7 +321,7 @@ def repair_file(src: Path, out_dir: Path) -> str:
         f"DONE  {src.name}: source={fmt_size(original_size)} "
         f"{ftyp_note} moov={plan.moov.offset:,}/{fmt_size(plan.moov.size)} "
         f"mdat={plan.mdat.offset:,}/{fmt_size(plan.mdat.size)} "
-        f"patched=stco:{patched_stco},co64:{patched_co64} "
+        f"mode={mode} patched=stco:{patched_stco},co64:{patched_co64} "
         f"output={fmt_size(repaired_size)} -> {out_file}"
     )
 
